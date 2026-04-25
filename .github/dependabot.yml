@@ -1,0 +1,15 @@
+# Dependabot config for keeping SHA-pinned GitHub Actions up to date.
+#
+# Copy this file into your repo's .github/ directory, or use it as reference
+# for your own dependabot.yml.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

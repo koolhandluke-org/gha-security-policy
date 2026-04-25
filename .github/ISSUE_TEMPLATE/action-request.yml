@@ -1,0 +1,67 @@
+name: Request New GitHub Action
+description: Request a new GitHub Action to be added to the org allowlist
+title: "[Action Request] "
+labels: ["action-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to request a new GitHub Action for the org allowlist.
+        All actions must be reviewed and approved before use.
+
+  - type: input
+    id: action-reference
+    attributes:
+      label: Action reference
+      description: "The action's owner/repo (e.g. `actions/checkout`)"
+      placeholder: "owner/repo"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / tag
+      description: "The version tag you want to pin (e.g. `v4.2.2`)"
+      placeholder: "v1.0.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: justification
+    attributes:
+      label: Justification
+      description: "Why does your team need this action? What problem does it solve?"
+      placeholder: "We need this action to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: "What other actions or approaches did you evaluate?"
+      placeholder: "We considered..."
+    validations:
+      required: true
+
+  - type: input
+    id: repo-url
+    attributes:
+      label: Action repository URL
+      description: "Link to the action's GitHub repository"
+      placeholder: "https://github.com/owner/repo"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: publisher-type
+    attributes:
+      label: Publisher type
+      description: "Who maintains this action?"
+      options:
+        - GitHub (official)
+        - Verified creator
+        - Community / third-party
+    validations:
+      required: true

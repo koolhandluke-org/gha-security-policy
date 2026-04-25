@@ -1,0 +1,137 @@
+name: Merge & Cleanup Allowlist
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/approved-actions.yml]
+  schedule:
+    # Monthly cleanup: 1st of every month at 06:00 UTC
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    name: Merge new SHAs into allowlist
+    runs-on: ubuntu-latest
+    # Only run on push (not on schedule or manual trigger)
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Merge approved-actions into allowlist
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          added=0
+          source=".github/workflows/approved-actions.yml"
+
+          # Parse uses: lines from the dummy workflow
+          # Format: - uses: owner/repo@sha # version
+          grep -oP 'uses:\s+\K\S+@\S+' "$source" | while IFS='@' read -r name sha; do
+            # Look up the version comment from the original line
+            version=$(grep -P "uses:\s+${name}@${sha}" "$source" | grep -oP '#\s*\K\S+' || echo "unknown")
+
+            # Check if this exact sha already exists in allowlist.yml
+            existing=$(yq -r ".actions[] | select(.name == \"$name\" and .sha == \"$sha\") | .name" allowlist.yml)
+
+            if [ -z "$existing" ]; then
+              echo "Adding $name@$version ($sha)"
+              yq -i ".actions += [{\"name\": \"$name\", \"version\": \"$version\", \"sha\": \"$sha\", \"added\": \"$today\"}]" allowlist.yml
+              added=$((added + 1))
+            else
+              echo "Already exists: $name@$sha"
+            fi
+          done
+
+          echo "### Merge Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Added **$added** new entries to allowlist.yml" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add allowlist.yml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: merge new SHAs into allowlist"
+            git push
+          fi
+
+  cleanup:
+    name: Remove expired entries
+    runs-on: ubuntu-latest
+    # Run on schedule, manual trigger, or after merge job
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.merge.result == 'success')
+    needs: [merge]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Pull latest in case merge job just pushed
+          ref: main
+
+      - name: Remove expired entries
+        run: |
+          retention_days=$(yq -r '.retention_days' allowlist.yml)
+          cutoff=$(date -u -d "$retention_days days ago" +%Y-%m-%d 2>/dev/null || date -u -v-${retention_days}d +%Y-%m-%d)
+          removed=0
+          removed_list=""
+          source=".github/workflows/approved-actions.yml"
+
+          # Build a set of current SHAs from approved-actions.yml (never removed)
+          current_shas=$(grep -oP 'uses:\s+\S+@\K[a-f0-9]{40}' "$source")
+
+          # Check each entry in allowlist.yml
+          count=$(yq '.actions | length' allowlist.yml)
+          indices_to_remove=""
+          for i in $(seq 0 $((count - 1))); do
+            added=$(yq -r ".actions[$i].added" allowlist.yml)
+            sha=$(yq -r ".actions[$i].sha" allowlist.yml)
+            name=$(yq -r ".actions[$i].name" allowlist.yml)
+            version=$(yq -r ".actions[$i].version" allowlist.yml)
+
+            # Skip if this is the current version (always kept)
+            if echo "$current_shas" | grep -q "$sha"; then
+              continue
+            fi
+
+            # Remove if older than retention period
+            if [[ "$added" < "$cutoff" ]]; then
+              echo "Removing expired: $name@$version (added $added)"
+              removed_list="$removed_list\n- $name@$version (added $added)"
+              indices_to_remove="$indices_to_remove $i"
+              removed=$((removed + 1))
+            fi
+          done
+
+          # Remove entries in reverse order to preserve indices
+          for i in $(echo "$indices_to_remove" | tr ' ' '\n' | sort -rn); do
+            [ -z "$i" ] && continue
+            yq -i "del(.actions[$i])" allowlist.yml
+          done
+
+          echo "### Cleanup Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Retention period: **$retention_days days** (cutoff: $cutoff)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$removed" -gt 0 ]; then
+            echo "Removed **$removed** expired entries:" >> "$GITHUB_STEP_SUMMARY"
+            echo -e "$removed_list" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No expired entries found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add allowlist.yml
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: remove expired entries from allowlist"
+            git push
+          fi
