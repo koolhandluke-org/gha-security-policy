@@ -35,3 +35,7 @@ actions:
     version: v5.0.5
     sha: 27d5ce7f107fe9357f9df03efb73ab90386fccae
     added: "2026-04-27"
+  - name: actions/upload-artifact
+    version: v7.0.1
+    sha: 043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+    added: "2026-04-27"
