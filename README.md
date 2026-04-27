@@ -89,7 +89,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 | Updating SHAs is manual and error-prone | Dependabot/Renovate automatically open PRs with new SHAs when versions are released |
 | No org-wide enforcement | The sync job pushes allowed SHAs to the GitHub org API — unapproved actions are blocked org-wide |
 | Updating the allowlist breaks teams still on the old version | The two-file model with retention keeps old SHAs valid during the migration window |
-| Developers can bypass pinning | The `enforce-pinning` reusable workflow blocks PRs that use unpinned actions |
+| Developers can bypass pinning | The org-level action policy only allows approved SHA-pinned actions to run |
 | No standard process for approving new actions | Issue template + security review workflow provides a clear request path |
 | Initial migration is painful | `migrate.sh` script bulk-converts `owner/repo@tag` to `owner/repo@sha # tag` across all workflows |
 
@@ -112,7 +112,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 - **Run `migrate.sh` before enabling Dependabot.** Dependabot can't update what isn't pinned yet.
 - **Keep the retention period generous.** 90 days is a good default. Shorter periods cause unnecessary breakage for teams with slower merge cycles.
 - **Use the issue template for new action requests.** This creates an auditable paper trail of what was approved, by whom, and why.
-- **Pin the `enforce-pinning` reusable workflow reference to `@main`.** Since this is your own org's repo, pinning to `main` is acceptable. Alternatively, tag releases of this repo and pin to those.
+- **Enable "Require actions to be SHA-pinned" in the org settings.** This is a built-in GitHub setting under Actions → General that enforces pinning without needing a separate workflow.
 
 ### Don't
 
@@ -130,21 +130,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 
 ## How to adopt in your repo
 
-### 1. Add the pinning check
-
-Create `.github/workflows/security.yml` in your repo:
-
-```yaml
-name: Security
-on: [pull_request]
-jobs:
-  enforce-pinning:
-    uses: your-org/gha-security-policy/.github/workflows/enforce-pinning.yml@main
-```
-
-This blocks any PR that uses unpinned actions.
-
-### 2. Set up automated SHA updates
+### 1. Set up automated SHA updates
 
 Pick **one** — Dependabot or Renovate.
 
@@ -182,7 +168,7 @@ This extends the shared config which will:
 - Open PRs when new versions are released with updated SHAs
 - Group all action updates into a single PR
 
-### 3. Migrate existing actions to SHA pins
+### 2. Migrate existing actions to SHA pins
 
 Run the migration script from this repo:
 
