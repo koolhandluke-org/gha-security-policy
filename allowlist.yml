@@ -2,39 +2,36 @@
 # Entries older than the retention period are removed automatically.
 
 retention_days: 90
-
 actions:
   - name: actions/checkout
     version: v4.2.2
     sha: 11bd71901bbe5b1630ceea73d27597364c9af683
     added: "2026-04-10"
-
   - name: actions/setup-node
     version: v4.4.0
     sha: 49933ea5288caeca8642d1e84afbd3f7d6820020
     added: "2026-04-10"
-
   - name: actions/cache
     version: v4.2.3
     sha: 5a3ec84eff668545956fd18022155c47e93e2684
     added: "2026-04-10"
-
   - name: actions/upload-artifact
     version: v4.6.2
     sha: 6027d3ded4b3544a1272a7cd3e5f1d82c1741615
     added: "2026-04-10"
-
   - name: actions/download-artifact
     version: v4.3.0
     sha: 95815c38ab2b7093691ee1e1b06b6ef6fc33aade
     added: "2026-04-10"
-
   - name: zgosalvez/github-actions-ensure-sha-pinned-actions
     version: v5.0.4
     sha: ca46236c6ce584ae24bc6283ba8dcf4b3ec8a066
     added: "2026-04-10"
-
   - name: jfrog/setup-jfrog-cli
     version: v4.5.6
     sha: 9fe0f98bd45b19e6436f694f67b4e3a2e6d69ea5
     added: "2026-04-10"
+  - name: actions/cache
+    version: v5.0.5
+    sha: 27d5ce7f107fe9357f9df03efb73ab90386fccae
+    added: "2026-04-27"
