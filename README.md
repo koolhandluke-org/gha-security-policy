@@ -35,9 +35,9 @@ A **two-file model** that separates version tracking from SHA accumulation, comb
 approved-actions.yml                allowlist.yml                    GitHub Org API
 (latest version + SHA)              (all allowed SHAs)               (patterns_allowed)
 
-Dependabot/Renovate  ──►  merge workflow appends    ──►  sync workflow pushes
-updates uses: lines       new SHAs + retains old          exact SHA patterns
-                          for the retention window
+Dependabot/Renovate  ──►  merge, cleanup & sync workflow  ──►  GitHub Org API
+updates uses: lines       appends new SHAs, removes              receives exact
+                          expired, syncs to org API              SHA patterns
 ```
 
 | File | Purpose | Managed by |
@@ -62,10 +62,12 @@ The two-file model keeps automation simple: Dependabot/Renovate operate on a sta
 
 1. **Dependabot/Renovate** opens a PR updating `approved-actions.yml` when a new action version is released (e.g. `checkout v4.2.2 → v4.2.3`)
 2. A **human reviews and merges** the PR — this is the trust decision point
-3. The **merge-allowlist** workflow triggers on push: parses the new SHA from `approved-actions.yml` and appends it to `allowlist.yml` with today's date. The old SHA remains.
-4. The **sync-allowlist** workflow triggers on changes to `allowlist.yml`: pushes all SHAs as exact `owner/repo@sha` patterns to the GitHub org API (`/orgs/{ORG}/actions/permissions/selected-actions`)
-5. Consumer repos merge their own Dependabot/Renovate PRs at their own pace — both old and new SHAs are allowed
-6. A **monthly cleanup job** removes entries older than the retention period that are no longer the current version
+3. The **merge, cleanup & sync** workflow triggers on push — three jobs run in sequence:
+   - **Merge**: parses the new SHA from `approved-actions.yml` and appends it to `allowlist.yml` with today's date. The old SHA remains.
+   - **Cleanup**: removes entries older than the retention period that are no longer the current version.
+   - **Sync**: pushes all SHAs from `allowlist.yml` as exact `owner/repo@sha` patterns to the GitHub org API (`/orgs/{ORG}/actions/permissions/selected-actions`)
+4. Consumer repos merge their own Dependabot/Renovate PRs at their own pace — both old and new SHAs are allowed
+5. On schedule (monthly), the cleanup + sync jobs also run independently to expire old entries
 
 ### Retention
 
@@ -85,7 +87,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 | Mutable tags can be silently changed | Every action is referenced by immutable 40-char SHA — tag manipulation has no effect |
 | SHAs are opaque and unreadable | Version comments (`# v4.2.2`) are preserved alongside every SHA for human readability |
 | Updating SHAs is manual and error-prone | Dependabot/Renovate automatically open PRs with new SHAs when versions are released |
-| No org-wide enforcement | The sync workflow pushes allowed SHAs to the GitHub org API — unapproved actions are blocked org-wide |
+| No org-wide enforcement | The sync job pushes allowed SHAs to the GitHub org API — unapproved actions are blocked org-wide |
 | Updating the allowlist breaks teams still on the old version | The two-file model with retention keeps old SHAs valid during the migration window |
 | Developers can bypass pinning | The `enforce-pinning` reusable workflow blocks PRs that use unpinned actions |
 | No standard process for approving new actions | Issue template + security review workflow provides a clear request path |
@@ -98,9 +100,9 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 - **Auto-merging Dependabot PRs defeats the purpose.** If you auto-merge action update PRs without review, an attacker who publishes a malicious version as a new release will have it automatically rolled into your allowlist. Always review action updates.
 - **Dependabot cannot pin unpinned actions.** Dependabot only updates existing SHA pins — it won't convert `@v4` to `@sha`. You must run the initial migration first (see `migrate.sh`), then Dependabot keeps them updated. Renovate can auto-pin.
 - **Runner dependency on `yq`.** The merge and cleanup workflows use `yq` for YAML parsing. This is pre-installed on GitHub-hosted `ubuntu-latest` runners but may need to be installed on self-hosted runners.
-- **The org API replaces the entire pattern list on each sync.** The sync workflow sends a PUT (not PATCH) to the org API. If another system also manages the `patterns_allowed` list, they will overwrite each other. This repo should be the single source of truth for allowed action patterns.
+- **The org API replaces the entire pattern list on each sync.** The sync job sends a PUT (not PATCH) to the org API. If another system also manages the `patterns_allowed` list, they will overwrite each other. This repo should be the single source of truth for allowed action patterns.
 - **Docker-based actions are not covered.** Actions referenced as `docker://image:tag` are not tracked by this system. These are less common but have their own supply chain risks.
-- **`github_owned_allowed: true` is a fallback.** The sync workflow sets this flag, which allows all `actions/*` actions regardless of pinning. This is a convenience trade-off — if you want strict enforcement even for official actions, set this to `false` and ensure every official action is in the allowlist.
+- **`github_owned_allowed: true` is a fallback.** The sync job sets this flag, which allows all `actions/*` actions regardless of pinning. This is a convenience trade-off — if you want strict enforcement even for official actions, set this to `false` and ensure every official action is in the allowlist.
 
 ## Dos and don'ts
 
@@ -116,7 +118,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 
 - **Don't auto-merge action update PRs.** This removes the human review step that prevents compromised versions from entering the allowlist.
 - **Don't edit `allowlist.yml` by hand.** It's auto-managed by the merge workflow. Manual edits will be overwritten or cause merge conflicts.
-- **Don't use this alongside other tools that manage `patterns_allowed` on the org API.** The sync workflow does a full PUT, not a PATCH. It will overwrite external changes.
+- **Don't use this alongside other tools that manage `patterns_allowed` on the org API.** The sync job does a full PUT, not a PATCH. It will overwrite external changes.
 - **Don't reduce `retention_days` below your slowest team's merge cadence.** If a team takes 60 days to merge Dependabot PRs, a 30-day retention will break their workflows.
 - **Don't skip the initial migration.** Repos with unpinned actions (`@v4`) will not be tracked or updated by Dependabot. They remain vulnerable.
 
