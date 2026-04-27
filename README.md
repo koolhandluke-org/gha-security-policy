@@ -1,29 +1,43 @@
 # GitHub Actions Security Policy
 
-Org-wide policy for securing GitHub Actions against supply chain attacks.
+Org-wide framework for securing GitHub Actions against supply chain attacks through SHA pinning, automated version tracking, and centralized enforcement.
 
-## Why this exists
+## The problem
 
 GitHub Actions are a prime target for supply chain attacks. Mutable tags like `v1` or `v1.2.3` can be force-pushed to point at malicious commits, silently compromising every workflow that references them.
 
-Recent incidents:
+Every `uses:` line in a workflow is a trust decision. When a workflow references `actions/checkout@v4`, it trusts that the tag still points to the same code it did yesterday. That trust is misplaced — git tags are mutable. A repository owner (or an attacker with write access) can delete a tag, point it at a completely different commit, and force-push. No diff, no PR, no notification. The tag name hasn't changed. The version looks the same. But the code behind it is not.
 
-- **[Trivy Action (March 2026)](https://www.aquasec.com/blog/trivy-github-action-supply-chain-attack/)** — Compromised via malicious tag update
-- **[tj-actions/changed-files (March 2025)](https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-attack)** — Secrets exfiltrated from 23,000+ repos
+This is not theoretical:
 
-**SHA pinning eliminates this attack vector entirely.** A full 40-character commit SHA is immutable; it always resolves to the same code.
+- **[tj-actions/changed-files (March 2025)](https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-attack)** — An attacker gained access to the repo, modified the `v44` tag to point at a malicious commit that exfiltrated CI secrets (environment variables, `GITHUB_TOKEN`, any configured secrets). Over **23,000 repositories** were affected. The compromised code ran in CI pipelines across thousands of orgs before detection.
+- **[reviewdog actions (March 2025)](https://github.com/reviewdog/reviewdog/issues/2079)** — Multiple reviewdog GitHub Actions were compromised via the same supply chain vector, leaking secrets from CI runners.
+- **[Trivy Action (March 2026)](https://www.aquasec.com/blog/trivy-github-action-supply-chain-attack/)** — The widely-used container scanning action was compromised via a malicious tag update, injecting code into security scanning pipelines.
 
-## Architecture
+The pattern is always the same: attacker compromises an action repo, modifies a mutable tag, and every workflow that references it is instantly compromised.
 
-Two files work together to manage allowed SHAs across the org:
+### Why this is hard to solve manually
+
+SHA pinning is the known fix. A full 40-character commit SHA (`actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683`) is immutable and content-addressed — it always resolves to the exact same code. But pinning by hand creates new problems:
+
+- **SHAs are opaque.** `@v4.2.2` is readable. `@11bd71901bbe5b163...` is not. Developers don't know what version they're on.
+- **Updates are painful.** When a new version is released, someone has to look up the new SHA and update every workflow in every repo.
+- **Org-wide enforcement is missing.** Even if one team pins correctly, another team can still reference `@v4` and re-introduce the attack surface.
+- **Migration windows cause breakage.** If the org allowlist only permits the latest SHA, any repo that hasn't updated yet breaks immediately.
+
+This repo solves all of these.
+
+## The approach
+
+A **two-file model** that separates version tracking from SHA accumulation, combined with GitHub's org-level action policies for enforcement.
 
 ```
 approved-actions.yml                allowlist.yml                    GitHub Org API
-(latest SHAs)                       (all allowed SHAs)               (patterns_allowed)
+(latest version + SHA)              (all allowed SHAs)               (patterns_allowed)
 
 Dependabot/Renovate  ──►  merge workflow appends    ──►  sync workflow pushes
-updates uses: lines       new SHAs + removes              exact SHA patterns
-                          expired entries
+updates uses: lines       new SHAs + retains old          exact SHA patterns
+                          for the retention window
 ```
 
 | File | Purpose | Managed by |
@@ -31,22 +45,31 @@ updates uses: lines       new SHAs + removes              exact SHA patterns
 | `.github/workflows/approved-actions.yml` | One `uses:` line per action — always the latest version + SHA | Dependabot or Renovate |
 | `allowlist.yml` | Accumulated list of all currently-allowed SHAs with `added` dates | merge-allowlist workflow |
 
-The dummy workflow never runs (`if: false`). It exists so that Dependabot and Renovate can natively update the SHA pins — no custom regex managers needed.
+### Why two files?
 
-This two-file model allows teams to migrate at their own pace. When a version is bumped, both the old and new SHAs remain allowed during the retention period.
+A single file can't serve both purposes:
+
+- **Dependabot/Renovate** needs exactly one `uses:` per action to track the latest version. If you have multiple entries, it gets confused or creates conflicting PRs.
+- **The org API** needs every currently-allowed SHA (old + new) so that teams running the previous version don't break while they migrate.
+
+The two-file model keeps automation simple: Dependabot/Renovate operate on a standard workflow file with no custom configuration, while the allowlist accumulates SHAs and handles the migration window automatically.
+
+### The dummy workflow trick
+
+`approved-actions.yml` is a real workflow file, but it never runs (`if: false`). It exists purely so that Dependabot and Renovate can natively detect and update SHA-pinned actions — no custom regex managers, no scripts, no Renovate `matchManagers` configuration. Both tools already know how to update `uses:` lines in workflow files. This leverages that built-in capability.
 
 ## How it works
 
-1. **Dependabot/Renovate** opens a PR updating `approved-actions.yml` (e.g. `checkout v4.2.2 → v4.2.3`)
-2. A human reviews and merges the PR
-3. **merge-allowlist** workflow triggers: appends the new SHA to `allowlist.yml` with today's date (the old SHA remains)
-4. **sync-allowlist** workflow triggers: pushes all SHAs from `allowlist.yml` as exact `owner/repo@sha` patterns to the org API
-5. Consumer repos merge their own Dependabot/Renovate PRs at their own pace
-6. On schedule (monthly), the cleanup job removes entries older than `retention_days` that are no longer the current version
+1. **Dependabot/Renovate** opens a PR updating `approved-actions.yml` when a new action version is released (e.g. `checkout v4.2.2 → v4.2.3`)
+2. A **human reviews and merges** the PR — this is the trust decision point
+3. The **merge-allowlist** workflow triggers on push: parses the new SHA from `approved-actions.yml` and appends it to `allowlist.yml` with today's date. The old SHA remains.
+4. The **sync-allowlist** workflow triggers on changes to `allowlist.yml`: pushes all SHAs as exact `owner/repo@sha` patterns to the GitHub org API (`/orgs/{ORG}/actions/permissions/selected-actions`)
+5. Consumer repos merge their own Dependabot/Renovate PRs at their own pace — both old and new SHAs are allowed
+6. A **monthly cleanup job** removes entries older than the retention period that are no longer the current version
 
-## Retention
+### Retention
 
-Old SHAs are kept in `allowlist.yml` for the configured `retention_days` (default: 90 days). This gives teams time to merge their update PRs before the old SHA is removed from the org allowlist.
+Old SHAs are kept in `allowlist.yml` for the configured `retention_days` (default: **90 days**). This gives teams time to merge their update PRs before the old SHA is removed from the org allowlist.
 
 The cleanup job:
 - **Always keeps** entries that match the current version in `approved-actions.yml`
@@ -54,6 +77,48 @@ The cleanup job:
 - **Reports** what was removed in the GitHub Actions job summary
 
 To change the retention period, edit the `retention_days` field in `allowlist.yml`.
+
+## How this solves the problem
+
+| Problem | How it's solved |
+|---------|----------------|
+| Mutable tags can be silently changed | Every action is referenced by immutable 40-char SHA — tag manipulation has no effect |
+| SHAs are opaque and unreadable | Version comments (`# v4.2.2`) are preserved alongside every SHA for human readability |
+| Updating SHAs is manual and error-prone | Dependabot/Renovate automatically open PRs with new SHAs when versions are released |
+| No org-wide enforcement | The sync workflow pushes allowed SHAs to the GitHub org API — unapproved actions are blocked org-wide |
+| Updating the allowlist breaks teams still on the old version | The two-file model with retention keeps old SHAs valid during the migration window |
+| Developers can bypass pinning | The `enforce-pinning` reusable workflow blocks PRs that use unpinned actions |
+| No standard process for approving new actions | Issue template + security review workflow provides a clear request path |
+| Initial migration is painful | `migrate.sh` script bulk-converts `owner/repo@tag` to `owner/repo@sha # tag` across all workflows |
+
+## Limitations
+
+- **Requires GitHub org-level API access.** The sync workflow uses the `/orgs/{ORG}/actions/permissions/selected-actions` endpoint, which requires an `ORG_ADMIN_TOKEN` with `admin:org` scope. This is a privileged credential.
+- **Does not protect against compromised code at the time of pinning.** SHA pinning guarantees immutability, not safety. If an action is already compromised when you pin it, you've pinned compromised code. The human review step on the Dependabot/Renovate PR is the trust boundary.
+- **Auto-merging Dependabot PRs defeats the purpose.** If you auto-merge action update PRs without review, an attacker who publishes a malicious version as a new release will have it automatically rolled into your allowlist. Always review action updates.
+- **Dependabot cannot pin unpinned actions.** Dependabot only updates existing SHA pins — it won't convert `@v4` to `@sha`. You must run the initial migration first (see `migrate.sh`), then Dependabot keeps them updated. Renovate can auto-pin.
+- **Runner dependency on `yq`.** The merge and cleanup workflows use `yq` for YAML parsing. This is pre-installed on GitHub-hosted `ubuntu-latest` runners but may need to be installed on self-hosted runners.
+- **The org API replaces the entire pattern list on each sync.** The sync workflow sends a PUT (not PATCH) to the org API. If another system also manages the `patterns_allowed` list, they will overwrite each other. This repo should be the single source of truth for allowed action patterns.
+- **Docker-based actions are not covered.** Actions referenced as `docker://image:tag` are not tracked by this system. These are less common but have their own supply chain risks.
+- **`github_owned_allowed: true` is a fallback.** The sync workflow sets this flag, which allows all `actions/*` actions regardless of pinning. This is a convenience trade-off — if you want strict enforcement even for official actions, set this to `false` and ensure every official action is in the allowlist.
+
+## Dos and don'ts
+
+### Do
+
+- **Review every Dependabot/Renovate PR before merging.** Read the changelog, check for unexpected scope changes. This is the trust decision.
+- **Run `migrate.sh` before enabling Dependabot.** Dependabot can't update what isn't pinned yet.
+- **Keep the retention period generous.** 90 days is a good default. Shorter periods cause unnecessary breakage for teams with slower merge cycles.
+- **Use the issue template for new action requests.** This creates an auditable paper trail of what was approved, by whom, and why.
+- **Pin the `enforce-pinning` reusable workflow reference to `@main`.** Since this is your own org's repo, pinning to `main` is acceptable. Alternatively, tag releases of this repo and pin to those.
+
+### Don't
+
+- **Don't auto-merge action update PRs.** This removes the human review step that prevents compromised versions from entering the allowlist.
+- **Don't edit `allowlist.yml` by hand.** It's auto-managed by the merge workflow. Manual edits will be overwritten or cause merge conflicts.
+- **Don't use this alongside other tools that manage `patterns_allowed` on the org API.** The sync workflow does a full PUT, not a PATCH. It will overwrite external changes.
+- **Don't reduce `retention_days` below your slowest team's merge cadence.** If a team takes 60 days to merge Dependabot PRs, a 30-day retention will break their workflows.
+- **Don't skip the initial migration.** Repos with unpinned actions (`@v4`) will not be tracked or updated by Dependabot. They remain vulnerable.
 
 ## How to request a new action
 
@@ -144,14 +209,6 @@ Requires `gh` (GitHub CLI) to be installed and authenticated.
 ### Why SHAs instead of tags?
 
 Tags are mutable. A repo owner (or attacker with push access) can delete and recreate a tag pointing at different code. SHAs are immutable and content-addressed — they always resolve to the exact same code.
-
-### Why two files instead of one?
-
-A single file can't serve both purposes:
-- Dependabot/Renovate needs exactly one `uses:` per action to track the latest version
-- The org API needs every currently-allowed SHA (old + new) during the migration window
-
-The two-file model keeps automation simple while allowing a grace period for teams to update.
 
 ### What happens if a team doesn't update in time?
 
