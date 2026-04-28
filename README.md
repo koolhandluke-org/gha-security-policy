@@ -35,9 +35,9 @@ A **two-file model** that separates version tracking from SHA accumulation, comb
 approved-actions.yml                allowlist.yml                    GitHub Org API
 (latest version + SHA)              (all allowed SHAs)               (patterns_allowed)
 
-Dependabot/Renovate  ──►  merge, cleanup & sync workflow  ──►  GitHub Org API
+Dependabot/Renovate  ──►  merge, audit & sync workflow    ──►  GitHub Org API
 updates uses: lines       appends new SHAs, removes              receives exact
-                          expired, syncs to org API              SHA patterns
+                          expired, audits drift, syncs           SHA patterns
 ```
 
 | File | Purpose | Managed by |
@@ -62,23 +62,13 @@ The two-file model keeps automation simple: Dependabot/Renovate operate on a sta
 
 1. **Dependabot/Renovate** opens a PR updating `approved-actions.yml` when a new action version is released (e.g. `checkout v4.2.2 → v4.2.3`)
 2. A **human reviews and merges** the PR — this is the trust decision point
-3. The **merge, cleanup & sync** workflow triggers on push — three jobs run in sequence:
+3. The **merge, audit & sync** workflow triggers on push — four jobs run in sequence:
    - **Merge**: parses the new SHA from `approved-actions.yml` and appends it to `allowlist.yml` with today's date. The old SHA remains.
-   - **Cleanup**: removes entries older than the retention period that are no longer the current version.
+   - **Cleanup**: removes entries older than `retention_days` that are no longer the current version.
+   - **Audit**: generates a read-only report showing stale entries and actions that are major versions behind.
    - **Sync**: pushes all SHAs from `allowlist.yml` as exact `owner/repo@sha` patterns to the GitHub org API (`/orgs/{ORG}/actions/permissions/selected-actions`)
 4. Consumer repos merge their own Dependabot/Renovate PRs at their own pace — both old and new SHAs are allowed
-5. On schedule (monthly), the cleanup + sync jobs also run independently to expire old entries
-
-### Retention
-
-Old SHAs are kept in `allowlist.yml` for the configured `retention_days` (default: **90 days**). This gives teams time to merge their update PRs before the old SHA is removed from the org allowlist.
-
-The cleanup job:
-- **Always keeps** entries that match the current version in `approved-actions.yml`
-- **Removes** entries older than `retention_days` that are not the current version
-- **Reports** what was removed in the GitHub Actions job summary
-
-To change the retention period, edit the `retention_days` field in `allowlist.yml`.
+5. On schedule (monthly), the cleanup, audit, and sync jobs run independently
 
 ## How this solves the problem
 
@@ -92,6 +82,43 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 | Developers can bypass pinning | The org-level action policy only allows approved SHA-pinned actions to run |
 | No standard process for approving new actions | Issue template + security review workflow provides a clear request path |
 | Initial migration is painful | `migrate.sh` script bulk-converts `owner/repo@tag` to `owner/repo@sha # tag` across all workflows |
+
+## Settings
+
+### Dependabot cooldown
+
+Dependabot is configured with a cooldown period before opening PRs for new releases. This is a supply chain defense — if an attacker publishes a malicious version, the delay gives the community time to detect and yank it before it reaches your workflows.
+
+```yaml
+# .github/dependabot.yml
+cooldown:
+  default-days: 5        # wait 5 days before opening PRs
+  semver-major-days: 7   # wait 7 days for major version bumps
+```
+
+Security updates (CVE advisories) bypass the cooldown and open immediately.
+
+To change these values, edit [`.github/dependabot.yml`](.github/dependabot.yml).
+
+### Retention
+
+Old SHAs are kept in `allowlist.yml` for `retention_days` (default: **180 days**) before the cleanup job removes them. This is intentionally forgiving — the allowlist is not the place to force teams onto newer versions. That's Dependabot/Renovate's job.
+
+The cleanup job:
+- **Always keeps** entries that match the current version in `approved-actions.yml`
+- **Removes** entries older than `retention_days` that are not the current version
+- **Reports** what was removed in the GitHub Actions job summary
+
+To change the retention period, edit `retention_days` in [`allowlist.yml`](allowlist.yml).
+
+### Audit report
+
+A monthly audit report runs alongside the cleanup job. It does not remove anything — it produces a read-only summary in the GitHub Actions job summary showing:
+
+- **Actions with entries that are one or more major versions behind** the current approved version
+- **All stale entries** (not the current version) with their age and the version they're on
+
+Use this report to identify repos that may need attention, not to auto-enforce upgrades.
 
 ## Limitations
 
@@ -110,7 +137,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 
 - **Review every Dependabot/Renovate PR before merging.** Read the changelog, check for unexpected scope changes. This is the trust decision.
 - **Run `migrate.sh` before enabling Dependabot.** Dependabot can't update what isn't pinned yet.
-- **Keep the retention period generous.** 90 days is a good default. Shorter periods cause unnecessary breakage for teams with slower merge cycles.
+- **Keep the retention period generous.** 180 days is the default. Shorter periods cause unnecessary breakage for teams with slower merge cycles.
 - **Use the issue template for new action requests.** This creates an auditable paper trail of what was approved, by whom, and why.
 - **Enable "Require actions to be SHA-pinned" in the org settings.** This is a built-in GitHub setting under Actions → General that enforces pinning without needing a separate workflow.
 
@@ -119,7 +146,7 @@ To change the retention period, edit the `retention_days` field in `allowlist.ym
 - **Don't auto-merge action update PRs.** This removes the human review step that prevents compromised versions from entering the allowlist.
 - **Don't edit `allowlist.yml` by hand.** It's auto-managed by the merge workflow. Manual edits will be overwritten or cause merge conflicts.
 - **Don't use this alongside other tools that manage `patterns_allowed` on the org API.** The sync job does a full PUT, not a PATCH. It will overwrite external changes.
-- **Don't reduce `retention_days` below your slowest team's merge cadence.** If a team takes 60 days to merge Dependabot PRs, a 30-day retention will break their workflows.
+- **Don't reduce `retention_days` below your slowest team's merge cadence.** If a team takes 120 days to merge Dependabot PRs, a 90-day retention will break their workflows.
 - **Don't skip the initial migration.** Repos with unpinned actions (`@v4`) will not be tracked or updated by Dependabot. They remain vulnerable.
 
 ## How to request a new action
@@ -145,6 +172,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 5
+      semver-major-days: 7
     groups:
       github-actions:
         patterns:
@@ -200,7 +230,7 @@ Tags are mutable. A repo owner (or attacker with push access) can delete and rec
 
 ### What happens if a team doesn't update in time?
 
-After `retention_days`, the old SHA is removed from the org allowlist. Workflows using that SHA will fail with a permissions error. The team needs to merge their pending update PR (or manually update) to use the current SHA.
+After `retention_days` (default: 180 days), the old SHA is removed from the org allowlist. Workflows using that SHA will fail with a permissions error. The team needs to merge their pending update PR (or manually update) to use the current SHA. The monthly audit report flags these entries before they expire so teams have advance warning.
 
 ### Does this break Dependabot/Renovate updates?
 

@@ -1,7 +1,8 @@
-# Auto-managed by the merge workflow. Do NOT edit manually.
-# Entries older than the retention period are removed automatically.
+# Auto-managed by the merge workflow.
+# Stale entries are auto-removed after retention_days.
+# The monthly audit report flags entries that are major versions behind.
 
-retention_days: 90
+retention_days: 180
 actions:
   - name: actions/checkout
     version: v4.2.2

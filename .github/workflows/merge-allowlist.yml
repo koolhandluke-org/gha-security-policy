@@ -1,11 +1,11 @@
-name: Merge, Cleanup & Sync Allowlist
+name: Merge, Audit & Sync Allowlist
 
 on:
   push:
     branches: [main]
     paths: [.github/workflows/approved-actions.yml]
   schedule:
-    # Monthly cleanup: 1st of every month at 06:00 UTC
+    # Monthly audit + cleanup: 1st of every month at 06:00 UTC
     - cron: "0 6 1 * *"
   workflow_dispatch:
 
@@ -16,7 +16,6 @@ jobs:
   merge:
     name: Merge new SHAs into allowlist
     runs-on: ubuntu-latest
-    # Only run on push (not on schedule or manual trigger)
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -27,13 +26,8 @@ jobs:
           added=0
           source=".github/workflows/approved-actions.yml"
 
-          # Parse uses: lines from the dummy workflow
-          # Format: - uses: owner/repo@sha # version
           grep -oP 'uses:\s+\K\S+@\S+' "$source" | while IFS='@' read -r name sha; do
-            # Look up the version comment from the original line
             version=$(grep -P "uses:\s+${name}@${sha}" "$source" | grep -oP '#\s*\K\S+' || echo "unknown")
-
-            # Check if this exact sha already exists in allowlist.yml
             existing=$(yq -r ".actions[] | select(.name == \"$name\" and .sha == \"$sha\") | .name" allowlist.yml)
 
             if [ -z "$existing" ]; then
@@ -64,13 +58,11 @@ jobs:
   cleanup:
     name: Remove expired entries
     runs-on: ubuntu-latest
-    # Run on schedule, manual trigger, or after merge job
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.merge.result == 'success')
     needs: [merge]
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.merge.result == 'success')
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          # Pull latest in case merge job just pushed
           ref: main
 
       - name: Remove expired entries
@@ -81,10 +73,9 @@ jobs:
           removed_list=""
           source=".github/workflows/approved-actions.yml"
 
-          # Build a set of current SHAs from approved-actions.yml (never removed)
+          # Current SHAs are never removed
           current_shas=$(grep -oP 'uses:\s+\S+@\K[a-f0-9]{40}' "$source")
 
-          # Check each entry in allowlist.yml
           count=$(yq '.actions | length' allowlist.yml)
           indices_to_remove=""
           for i in $(seq 0 $((count - 1))); do
@@ -93,12 +84,10 @@ jobs:
             name=$(yq -r ".actions[$i].name" allowlist.yml)
             version=$(yq -r ".actions[$i].version" allowlist.yml)
 
-            # Skip if this is the current version (always kept)
             if echo "$current_shas" | grep -q "$sha"; then
               continue
             fi
 
-            # Remove if older than retention period
             if [[ "$added" < "$cutoff" ]]; then
               echo "Removing expired: $name@$version (added $added)"
               removed_list="$removed_list\n- $name@$version (added $added)"
@@ -107,7 +96,7 @@ jobs:
             fi
           done
 
-          # Remove entries in reverse order to preserve indices
+          # Remove in reverse order to preserve indices
           for i in $(echo "$indices_to_remove" | tr ' ' '\n' | sort -rn); do
             [ -z "$i" ] && continue
             yq -i "del(.actions[$i])" allowlist.yml
@@ -136,21 +125,110 @@ jobs:
             git push
           fi
 
-  sync:
-    name: Sync allowlist to org API
+  audit:
+    name: Audit stale entries
     runs-on: ubuntu-latest
     needs: [cleanup]
-    if: always() && (needs.merge.result == 'success' || needs.cleanup.result == 'success')
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.cleanup.result == 'success')
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          # Pull latest in case merge or cleanup just pushed
+          ref: main
+
+      - name: Generate audit report
+        run: |
+          source=".github/workflows/approved-actions.yml"
+          today=$(date -u +%Y-%m-%d)
+          stale_count=0
+          major_behind_count=0
+          stale_lines=""
+          major_lines=""
+
+          # Build map of current versions from approved-actions.yml
+          declare -A current_versions
+          declare -A current_shas
+          while IFS= read -r line; do
+            name=$(echo "$line" | grep -oP 'uses:\s+\K[^@]+')
+            sha=$(echo "$line" | grep -oP '@\K[a-f0-9]{40}')
+            version=$(echo "$line" | grep -oP '#\s*\K\S+' || echo "unknown")
+            current_versions["$name"]="$version"
+            current_shas["$name"]="$sha"
+          done < <(grep -P 'uses:\s+\S+@[a-f0-9]{40}' "$source")
+
+          # Check each allowlist entry
+          count=$(yq '.actions | length' allowlist.yml)
+          for i in $(seq 0 $((count - 1))); do
+            name=$(yq -r ".actions[$i].name" allowlist.yml)
+            version=$(yq -r ".actions[$i].version" allowlist.yml)
+            sha=$(yq -r ".actions[$i].sha" allowlist.yml)
+            added=$(yq -r ".actions[$i].added" allowlist.yml)
+
+            # Skip current version
+            if [ "${current_shas[$name]}" = "$sha" ]; then
+              continue
+            fi
+
+            # Calculate age
+            added_epoch=$(date -u -d "$added" +%s 2>/dev/null || date -u -j -f "%Y-%m-%d" "$added" +%s)
+            today_epoch=$(date -u +%s)
+            age_days=$(( (today_epoch - added_epoch) / 86400 ))
+
+            # Compare major versions
+            entry_major=$(echo "$version" | grep -oP '^v?\K[0-9]+')
+            current_version="${current_versions[$name]}"
+            current_major=$(echo "$current_version" | grep -oP '^v?\K[0-9]+')
+
+            stale_count=$((stale_count + 1))
+            stale_lines="$stale_lines\n| $name | $version | $current_version | ${age_days}d | $added |"
+
+            # Flag if major version behind
+            if [ -n "$entry_major" ] && [ -n "$current_major" ]; then
+              major_diff=$((current_major - entry_major))
+              if [ "$major_diff" -ge 1 ]; then
+                major_behind_count=$((major_behind_count + 1))
+                major_lines="$major_lines\n| $name | $version | $current_version | **${major_diff} major** behind | ${age_days}d |"
+              fi
+            fi
+          done
+
+          # Write report
+          echo "### Allowlist Audit Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Generated: $today" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$major_behind_count" -gt 0 ]; then
+            echo "#### Major versions behind ($major_behind_count)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Action | Allowed version | Current version | Gap | Age |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|----------------|-----------------|-----|-----|" >> "$GITHUB_STEP_SUMMARY"
+            echo -e "$major_lines" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$stale_count" -gt 0 ]; then
+            echo "#### All stale entries ($stale_count)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Action | Allowed version | Current version | Age | Added |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|----------------|-----------------|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo -e "$stale_lines" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "All allowlist entries are current." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  sync:
+    name: Sync allowlist to org API
+    runs-on: ubuntu-latest
+    needs: [audit]
+    if: always() && (needs.merge.result == 'success' || needs.audit.result == 'success')
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
           ref: main
 
       - name: Build patterns from allowlist
         id: patterns
         run: |
-          # Extract exact owner/repo@sha patterns from allowlist.yml
           patterns=$(yq -r '.actions[] | .name + "@" + .sha' allowlist.yml | jq -R . | jq -sc .)
           echo "json=$patterns" >> "$GITHUB_OUTPUT"
           echo "### Sync Summary" >> "$GITHUB_STEP_SUMMARY"
