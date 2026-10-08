@@ -9,6 +9,10 @@ on:
     - cron: "0 6 1 * *"
   workflow_dispatch:
 
+concurrency:
+  group: merge-allowlist
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -20,13 +24,56 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Verify SHA-to-tag mapping
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source=".github/workflows/approved-actions.yml"
+          verification_failed=0
+
+          while IFS='@' read -r name sha; do
+            version=$(grep -P "uses:\s+${name}@${sha}" "$source" | grep -oP '#\s*\K\S+' || echo "unknown")
+            if [ "$version" = "unknown" ]; then
+              echo "::warning::No version comment for ${name}@${sha} — skipping verification"
+              continue
+            fi
+
+            # Resolve the tag ref via GitHub API
+            ref_response=$(gh api "repos/${name}/git/ref/tags/${version}" 2>/dev/null) || {
+              echo "::warning::Cannot resolve tag ${version} for ${name} — skipping verification"
+              continue
+            }
+
+            obj_type=$(echo "$ref_response" | jq -r '.object.type')
+            obj_sha=$(echo "$ref_response" | jq -r '.object.sha')
+
+            # Annotated tags need dereferencing (type=tag -> follow to commit)
+            if [ "$obj_type" = "tag" ]; then
+              obj_sha=$(gh api "repos/${name}/git/tags/${obj_sha}" --jq '.object.sha' 2>/dev/null || echo "")
+            fi
+
+            if [ "$obj_sha" != "$sha" ]; then
+              echo "::error::SHA mismatch for ${name}@${version}: pinned ${sha}, tag resolves to ${obj_sha}"
+              verification_failed=1
+            else
+              echo "Verified: ${name}@${version} -> ${sha}"
+            fi
+          done < <(grep -oP 'uses:\s+\K\S+@\S+' "$source")
+
+          if [ "$verification_failed" -eq 1 ]; then
+            echo "::error::One or more SHA-to-tag verifications failed"
+            exit 1
+          fi
+
       - name: Merge approved-actions into allowlist
         run: |
+          set -euo pipefail
           today=$(date -u +%Y-%m-%d)
           added=0
           source=".github/workflows/approved-actions.yml"
 
-          grep -oP 'uses:\s+\K\S+@\S+' "$source" | while IFS='@' read -r name sha; do
+          while IFS='@' read -r name sha; do
             version=$(grep -P "uses:\s+${name}@${sha}" "$source" | grep -oP '#\s*\K\S+' || echo "unknown")
             existing=$(yq -r ".actions[] | select(.name == \"$name\" and .sha == \"$sha\") | .name" allowlist.yml)
 
@@ -37,7 +84,7 @@ jobs:
             else
               echo "Already exists: $name@$sha"
             fi
-          done
+          done < <(grep -oP 'uses:\s+\K\S+@\S+' "$source")
 
           echo "### Merge Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -45,6 +92,7 @@ jobs:
 
       - name: Commit changes
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add allowlist.yml
@@ -67,6 +115,7 @@ jobs:
 
       - name: Remove expired entries
         run: |
+          set -euo pipefail
           retention_days=$(yq -r '.retention_days' allowlist.yml)
           cutoff=$(date -u -d "$retention_days days ago" +%Y-%m-%d 2>/dev/null || date -u -v-${retention_days}d +%Y-%m-%d)
           removed=0
@@ -74,7 +123,7 @@ jobs:
           source=".github/workflows/approved-actions.yml"
 
           # Current SHAs are never removed
-          current_shas=$(grep -oP 'uses:\s+\S+@\K[a-f0-9]{40}' "$source")
+          current_shas=$(grep -oP 'uses:\s+\S+@\K[a-f0-9]{40}' "$source" || true)
 
           count=$(yq '.actions | length' allowlist.yml)
           indices_to_remove=""
@@ -115,6 +164,7 @@ jobs:
 
       - name: Commit changes
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add allowlist.yml
@@ -137,6 +187,7 @@ jobs:
 
       - name: Generate audit report
         run: |
+          set -euo pipefail
           source=".github/workflows/approved-actions.yml"
           today=$(date -u +%Y-%m-%d)
           stale_count=0
@@ -164,7 +215,7 @@ jobs:
             added=$(yq -r ".actions[$i].added" allowlist.yml)
 
             # Skip current version
-            if [ "${current_shas[$name]}" = "$sha" ]; then
+            if [ "${current_shas[$name]:-}" = "$sha" ]; then
               continue
             fi
 
@@ -174,9 +225,9 @@ jobs:
             age_days=$(( (today_epoch - added_epoch) / 86400 ))
 
             # Compare major versions
-            entry_major=$(echo "$version" | grep -oP '^v?\K[0-9]+')
-            current_version="${current_versions[$name]}"
-            current_major=$(echo "$current_version" | grep -oP '^v?\K[0-9]+')
+            entry_major=$(echo "$version" | grep -oP '^v?\K[0-9]+' || echo "")
+            current_version="${current_versions[$name]:-}"
+            current_major=$(echo "$current_version" | grep -oP '^v?\K[0-9]+' || echo "")
 
             stale_count=$((stale_count + 1))
             stale_lines="$stale_lines\n| $name | $version | $current_version | ${age_days}d | $added |"
@@ -227,10 +278,17 @@ jobs:
           ref: main
 
       - name: Build patterns from allowlist
-        id: patterns
         run: |
+          set -euo pipefail
           patterns=$(yq -r '.actions[] | .name + "@" + .sha' allowlist.yml | jq -R . | jq -sc .)
-          echo "json=$patterns" >> "$GITHUB_OUTPUT"
+
+          # Write full payload to file to avoid expression injection
+          jq -n --argjson patterns "$patterns" '{
+            "github_owned_allowed": true,
+            "verified_allowed": false,
+            "patterns_allowed": $patterns
+          }' > /tmp/payload.json
+
           echo "### Sync Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Pushing **$(echo "$patterns" | jq '. | length')** patterns to org API" >> "$GITHUB_STEP_SUMMARY"
@@ -240,15 +298,39 @@ jobs:
           GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
           ORG: ${{ github.repository_owner }}
         run: |
+          set -euo pipefail
+
+          # Drift detection: compare current API state with what we're about to push
+          current=$(gh api "/orgs/${ORG}/actions/permissions/selected-actions" --jq '.patterns_allowed' 2>/dev/null || echo "[]")
+          desired=$(jq -r '.patterns_allowed' /tmp/payload.json)
+
+          # Patterns in API but not in file = manual drift
+          drift_out=$(comm -23 \
+            <(echo "$current" | jq -r '.[]' | sort) \
+            <(echo "$desired" | jq -r '.[]' | sort) || true)
+          # Patterns in file but not in API = expected additions
+          drift_in=$(comm -13 \
+            <(echo "$current" | jq -r '.[]' | sort) \
+            <(echo "$desired" | jq -r '.[]' | sort) || true)
+
+          if [ -n "$drift_out" ]; then
+            echo "::warning::Manual drift detected — patterns in org API but not in allowlist:"
+            echo "$drift_out"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "#### Drift detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "Patterns in org API but **not** in allowlist (manual additions):" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$drift_out" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "$drift_in" ]; then
+            echo "New patterns being added to org API:"
+            echo "$drift_in"
+          fi
+
           gh api \
             --method PUT \
             "/orgs/${ORG}/actions/permissions/selected-actions" \
-            --input - <<EOF
-          {
-            "github_owned_allowed": true,
-            "verified_allowed": false,
-            "patterns_allowed": ${{ steps.patterns.outputs.json }}
-          }
-          EOF
+            --input /tmp/payload.json
 
           echo "Org action patterns updated successfully."

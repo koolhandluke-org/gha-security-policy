@@ -1,0 +1,6 @@
+# Security-critical files — require security team review
+/.github/workflows/approved-actions.yml @ORG/security-team
+/.github/workflows/merge-allowlist.yml  @ORG/security-team
+/.github/workflows/scan-org-repos.yml   @ORG/security-team
+/allowlist.yml                          @ORG/security-team
+/CODEOWNERS                             @ORG/security-team
