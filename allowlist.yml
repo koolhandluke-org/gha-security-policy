@@ -2,7 +2,9 @@
 # Stale entries are auto-removed after retention_days.
 # The monthly audit report flags entries that are major versions behind.
 
+# Policy
 retention_days: 180
+expiry_warning_days: 30
 actions:
   - name: actions/checkout
     version: v4.2.2

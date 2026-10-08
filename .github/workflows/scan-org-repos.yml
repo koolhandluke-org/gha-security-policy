@@ -29,10 +29,32 @@ jobs:
           grep -oP 'uses:\s+\K\S+@[a-f0-9]{40}' "$approved" > /tmp/current_refs.txt || true
           yq -r '.actions[] | .name + "@" + .sha' allowlist.yml > /tmp/allowed_refs.txt || true
 
+          # Read policy config from allowlist.yml
+          retention_days=$(yq -r '.retention_days' allowlist.yml)
+          expiry_warning_days=$(yq -r '.expiry_warning_days // 30' allowlist.yml)
+
+          # Build expiring refs — entries within expiry_warning_days of retention cutoff
+          warning_days=$((retention_days - expiry_warning_days))
+          warning_cutoff=$(date -u -d "${warning_days} days ago" +%Y-%m-%d 2>/dev/null || date -u -v-${warning_days}d +%Y-%m-%d)
+          > /tmp/expiring_refs.txt
+          count=$(yq '.actions | length' allowlist.yml)
+          for i in $(seq 0 $((count - 1))); do
+            added=$(yq -r ".actions[$i].added" allowlist.yml)
+            sha=$(yq -r ".actions[$i].sha" allowlist.yml)
+            name=$(yq -r ".actions[$i].name" allowlist.yml)
+            # Skip current SHAs (they're never removed)
+            if grep -qF "$sha" /tmp/current_refs.txt; then
+              continue
+            fi
+            if [[ "$added" < "$warning_cutoff" ]]; then
+              echo "${name}@${sha}" >> /tmp/expiring_refs.txt
+            fi
+          done
+
           # Initialize result files
           > /tmp/unknown.txt
-          > /tmp/unpinned.txt
           > /tmp/stale.txt
+          > /tmp/expiring.txt
           total_repos=0
           scanned_repos=0
 
@@ -63,10 +85,13 @@ jobs:
                 # Skip local (./) and docker:// references
                 [[ "$ref" =~ ^(\./|docker://) ]] && continue
 
-                if [[ ! "$ref" =~ @[a-f0-9]{40}$ ]]; then
-                  echo "| ${repo} | ${wf} | \`${ref}\` |" >> /tmp/unpinned.txt
-                elif grep -qxF "$ref" /tmp/current_refs.txt; then
+                # Skip refs without a SHA pin (tags won't be allowed anyway)
+                [[ "$ref" =~ @[a-f0-9]{40}$ ]] || continue
+
+                if grep -qxF "$ref" /tmp/current_refs.txt; then
                   : # CURRENT — nothing to report
+                elif grep -qxF "$ref" /tmp/expiring_refs.txt; then
+                  echo "| ${repo} | ${wf} | \`${ref}\` |" >> /tmp/expiring.txt
                 elif grep -qxF "$ref" /tmp/allowed_refs.txt; then
                   echo "| ${repo} | ${wf} | \`${ref}\` |" >> /tmp/stale.txt
                 else
@@ -84,8 +109,20 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
           unknown_count=$(wc -l < /tmp/unknown.txt | tr -d ' ')
-          unpinned_count=$(wc -l < /tmp/unpinned.txt | tr -d ' ')
           stale_count=$(wc -l < /tmp/stale.txt | tr -d ' ')
+          expiring_count=$(wc -l < /tmp/expiring.txt | tr -d ' ')
+
+          if [ "$expiring_count" -gt 0 ]; then
+            echo "#### EXPIRING ($expiring_count) — repos using SHAs about to be removed from allowlist" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "These entries are within ${expiry_warning_days} days of the ${retention_days}-day retention cutoff." >> "$GITHUB_STEP_SUMMARY"
+            echo "Repos must update or their actions will become UNKNOWN after cleanup." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Repo | Workflow | Action |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|------|----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/expiring.txt >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
           if [ "$unknown_count" -gt 0 ]; then
             echo "#### UNKNOWN ($unknown_count) — not in allowlist" >> "$GITHUB_STEP_SUMMARY"
@@ -93,15 +130,6 @@ jobs:
             echo "| Repo | Workflow | Action |" >> "$GITHUB_STEP_SUMMARY"
             echo "|------|----------|--------|" >> "$GITHUB_STEP_SUMMARY"
             cat /tmp/unknown.txt >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-          if [ "$unpinned_count" -gt 0 ]; then
-            echo "#### UNPINNED ($unpinned_count) — using tags instead of SHAs" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "| Repo | Workflow | Action |" >> "$GITHUB_STEP_SUMMARY"
-            echo "|------|----------|--------|" >> "$GITHUB_STEP_SUMMARY"
-            cat /tmp/unpinned.txt >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -114,6 +142,6 @@ jobs:
             echo "" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          if [ "$unknown_count" -eq 0 ] && [ "$unpinned_count" -eq 0 ] && [ "$stale_count" -eq 0 ]; then
+          if [ "$unknown_count" -eq 0 ] && [ "$stale_count" -eq 0 ] && [ "$expiring_count" -eq 0 ]; then
             echo "All repos are using current, pinned, allowed actions." >> "$GITHUB_STEP_SUMMARY"
           fi
