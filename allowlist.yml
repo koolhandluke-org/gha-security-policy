@@ -14,14 +14,6 @@ actions:
     version: v4.4.0
     sha: 49933ea5288caeca8642d1e84afbd3f7d6820020
     added: "2026-04-10"
-  - name: actions/cache
-    version: v4.2.3
-    sha: 5a3ec84eff668545956fd18022155c47e93e2684
-    added: "2026-04-10"
-  - name: actions/upload-artifact
-    version: v4.6.2
-    sha: 6027d3ded4b3544a1272a7cd3e5f1d82c1741615
-    added: "2026-04-10"
   - name: actions/download-artifact
     version: v4.3.0
     sha: 95815c38ab2b7093691ee1e1b06b6ef6fc33aade
